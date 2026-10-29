@@ -1,0 +1,206 @@
+name: graph-rca-microservices
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rca
+      POSTGRES_USER: rca
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rca-local-password}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rca -d rca"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  flyway:
+    image: flyway/flyway:10
+    command: migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/rca
+      FLYWAY_USER: rca
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:-rca-local-password}
+      FLYWAY_CONNECT_RETRIES: 10
+    volumes:
+      - ./backend/common/db/migration:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  user-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services/user-service
+        APP_ARTIFACT: user-service
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_SERVICE_URL: http://order-service:8080
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+  order-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services/order-service
+        APP_ARTIFACT: order-service
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PAYMENT_SERVICE_URL: http://payment-service:8080
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+  payment-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services/payment-service
+        APP_ARTIFACT: payment-service
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      INVENTORY_SERVICE_URL: http://inventory-service:8080
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+  inventory-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services/inventory-service
+        APP_ARTIFACT: inventory-service
+    ports:
+      - "8083:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      NOTIFICATION_SERVICE_URL: http://notification-service:8080
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+  notification-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: services/notification-service
+        APP_ARTIFACT: notification-service
+    ports:
+      - "8084:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+  rca-engine:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: rca-engine
+        APP_ARTIFACT: rca-engine
+    ports:
+      - "8091:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: jdbc:postgresql://postgres:5432/rca
+      DATABASE_USER: rca
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-rca-local-password}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        APP_MODULE: api-gateway
+        APP_ARTIFACT: api-gateway
+    ports:
+      - "8090:8080"
+    environment:
+      ENGINE_BASE_URL: http://rca-engine:8080
+      GATEWAY_CORS_ALLOWED_ORIGINS: http://localhost:5173,http://localhost:3000
+    depends_on:
+      rca-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
